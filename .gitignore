@@ -1,5 +1,7 @@
 # Folders
 .*/
+__pycache__/
 
 # Files
 *.json
+test*.py
