@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import json
 import asyncpraw
 import logging
@@ -60,7 +62,7 @@ class Filter():
 
         for f in self.filters:
             if not f.filter(item):
-                self.logging.debug(f'item {item.id} blocked by "{self.name}"')
+                self.logger.debug(f'item {item.id} blocked by "{self.name}"')
                 return True
         return False
 
@@ -77,11 +79,9 @@ class BaseReader(Filter):
     """
 
     def __init__(self, credentials_path: str = None, **kwargs):
-        # Connect and authenticate
+        super().__init__(**kwargs)
         self.logger = logging.getLogger(__name__)
-        self.connect(
-            self.__get_auth(credentials_path)
-        )
+        self.credentials_path = credentials_path
         self.handlers = []
         self.run = True
 
@@ -117,15 +117,18 @@ class BaseReader(Filter):
 
         self.handlers.append(handler)
 
-    def connect(self, auth: dict):
+    async def connect(self):
         """Creates an authenticated connection to Reddit"""
 
         # Authenticate using the passed in details
-        self.connection = asyncpraw.Reddit(**auth)
+        self.connection = asyncpraw.Reddit(
+            **self.__get_auth(self.credentials_path)
+        )
 
         # Test the connection by getting one post
         try:
-            for sub in self.connection.subreddit('all').new(limit=1):
+            subreddit = await self.connection.subreddit('all')
+            async for sub in subreddit.new(limit=3):
                 msg = f'Connection tested with {sub.id}: {sub.title}'
                 self.logger.debug(msg)
         except Exception:
@@ -136,6 +139,18 @@ class BaseReader(Filter):
 
         # This should be overridden by the subclass
         raise NotImplementedError
+
+    @staticmethod
+    def stream_args(**kwargs):
+        return {
+            k: v for k, v in kwargs.items() if k in [
+                'function',
+                'pause_after',
+                'skip_existing',
+                'attribute_name',
+                'exclude_before'
+            ]
+        }
 
 
 class BaseHandler(Filter):
@@ -168,18 +183,6 @@ class BaseHandler(Filter):
 
         raise NotImplementedError
 
-    @staticmethod
-    def __stream_args(**kwargs):
-        return {
-            k: v for k, v in kwargs.items() if k in [
-                'function',
-                'pause_after',
-                'skip_existing',
-                'attribute_name',
-                'exclude_before'
-            ]
-        }
-
 
 class CommentReader(BaseReader):
     """
@@ -201,26 +204,27 @@ class CommentReader(BaseReader):
 
         self.logger.debug(f'Monitoring comments in {subreddit}')
         subreddit = self.connection.subreddit(subreddit)
-        stream = subreddit.stream.comments(self.__stream_args(**kwargs))
-        async for item in stream:
+        args = self.stream_args(**kwargs)
+        stream = subreddit.stream.comments(**args)
+        async for comment in stream:
             if not self.run:
                 self.logger.info('Breaking monitoring...')
                 break
 
-            if not isinstance(item, Comment):
-                self.warning(f'Expected comment but got {type(item)}')
+            if not isinstance(comment, Comment):
+                self.__log_type_warning(Comment(), comment)
                 continue
 
             # Check filters
             for f in self.filters:
-                if f.test(item):
+                if f.test(comment):
                     continue
 
-            self.logger.info(f'Handling comment: {item.id}')
+            self.logger.info(f'Handling comment: {comment.id}')
 
             # Invoke handlers
             for h in self.handlers:
-                h.handle(item)
+                h.handle(comment)
 
 
 class SubmissionReader(BaseReader):
@@ -242,27 +246,42 @@ class SubmissionReader(BaseReader):
         """
 
         self.logger.debug(f'Monitoring submissions in {subreddit}')
-        subreddit = self.connection.subreddit(subreddit)
-        stream = subreddit.stream.submissions(self.__stream_args(**kwargs))
-        async for item in stream:
+        subreddit = await self.connection.subreddit(subreddit)
+        args = self.stream_args(**kwargs)
+        stream = subreddit.stream.submissions(**args)
+
+        async for submission in stream:
             if not self.run:
                 self.logger.info('Breaking monitoring...')
                 break
 
-            if not isinstance(item, Submission):
-                self.warning(f'Expected submission but got {type(item)}')
+            if not isinstance(submission, Submission):
+                self.__log_type_warning(Submission(), submission)
                 continue
 
             # Check filters
             for f in self.filters:
-                if f.test(item):
+                if f.test(submission):
                     continue
 
-            self.logger.info(f'Handling submission: {item.id}')
+            self.logger.info(f'Handling submission: {submission.id}')
 
             # Invoke each handler
             for h in self.handlers:
-                h.handle(item)
+                h.handle(submission)
+
+    def __log_type_warning(self, wanted, got):
+        """
+        Logs a type mismatch warning
+
+        Arguments:
+            wanted -- the type we were expecting
+            got    -- the type we actually got
+        """
+
+        MSG = 'Expected {wt} but got {gt}'
+        self.logger.warning(MSG.format(
+            wt=type(wanted), gt=type(got)))
 
 
 class LoggerHandler(BaseHandler):
@@ -278,5 +297,5 @@ class LoggerHandler(BaseHandler):
         if isinstance(logger, logging.Logger):
             self.logger = logger
 
-    def handle(self, item: Tuple[Submission, Comment]):
+    def __handler_action(self, item: Tuple[Submission, Comment]):
         self.logger.debug(f'handled item {item.id}')
